@@ -17,7 +17,8 @@ button{background:var(--card);border:1px solid var(--line);border-radius:999px;p
 button.on{background:var(--acc);color:#000;border-color:var(--acc)}
 input,textarea{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
 #q{flex:1;min-width:140px}
-.chips{overflow-x:auto;flex-wrap:nowrap;padding:8px 0 2px}
+.chips{overflow-x:auto;flex-wrap:nowrap;padding:8px 0 2px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
 .chips button{white-space:nowrap;font-size:13px}
 main{max-width:1150px;margin:auto;padding:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:14px}
@@ -92,7 +93,9 @@ async function getWhere(id) {
     try {
       const nl = (await tmdb(`/movie/${id}/watch/providers`)).results.NL || {};
       const mine = myProv.map(p => p.provider_id);
-      where[id] = {list: (nl.flatrate || []).filter(p => mine.includes(p.provider_id)), link: nl.link};
+      const list = (nl.flatrate || []).filter(p => mine.includes(p.provider_id));
+      // one logo per service (e.g. "HBO Max" and "HBO Max Amazon Channel" are the same)
+      where[id] = {list: list.filter((p, i) => list.findIndex(q => serviceOf(q.provider_name) === serviceOf(p.provider_name)) === i), link: nl.link};
     } catch { where[id] = {list: []} }
   }
   return where[id];
