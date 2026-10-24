@@ -44,6 +44,7 @@ summary{cursor:pointer;color:var(--mute)}
     <button data-tab="foryou" class="on">For you</button>
     <button data-tab="watch">Watchlist</button>
     <button data-tab="seen">Seen</button>
+    <button id="regen">🔄 New picks</button>
     <button id="surprise">🎲 Surprise me</button>
     <button id="gear" aria-label="Settings">⚙︎</button>
   </div>
@@ -73,6 +74,7 @@ const S = Object.assign({key: '', ratings: {}, watch: {}, off: []}, JSON.parse(l
 const save = () => localStorage.setItem('movienight', JSON.stringify(S));
 
 let genres = {}, myProv = [], tab = 'foryou', genre = '', shown = new Map();
+let round = 0, lastCount = null; const past = new Set(); // "New picks": skip what you've already been shown
 const where = {}; // id -> {list, link}, in-memory cache
 
 async function tmdb(path, params = {}) {
@@ -127,16 +129,17 @@ function score(m, P) {
 }
 const matchPct = s => Math.round(100 / (1 + Math.exp(-s)));
 
-async function forYou() {
+async function forYou(fresh = false) {
   const ids = activeIds();
   if (!ids.length) return render([], 'Turn on at least one service.');
   status('Finding movies for you…');
   const P = profile();
+  if (fresh) { round++; shown.forEach((_, id) => past.add(id)) }
   const base = {watch_region: 'NL', with_watch_providers: ids.join('|'), with_watch_monetization_types: 'flatrate', 'vote_count.gte': 150};
   if (genre) base.with_genres = genre;
-  const reqs = [1, 2, 3].map(page => tmdb('/discover/movie', {...base, sort_by: 'popularity.desc', page}));
-  reqs.push(tmdb('/discover/movie', {...base, sort_by: 'vote_average.desc', 'vote_count.gte': 1500}));
-  if (!genre && P.topGenres.length) reqs.push(tmdb('/discover/movie', {...base, with_genres: P.topGenres.slice(0, 3).join('|'), sort_by: 'popularity.desc', page: 1 + (P.count % 3)}));
+  const reqs = [1, 2, 3].map(p => tmdb('/discover/movie', {...base, sort_by: 'popularity.desc', page: p + 3 * round}));
+  reqs.push(tmdb('/discover/movie', {...base, sort_by: 'vote_average.desc', 'vote_count.gte': 1500, page: 1 + round}));
+  if (!genre && P.topGenres.length) reqs.push(tmdb('/discover/movie', {...base, with_genres: P.topGenres.slice(0, 3).join('|'), sort_by: 'popularity.desc', page: 1 + round}));
   for (const id of P.liked.slice(0, 6)) reqs.push(tmdb(`/movie/${id}/recommendations`).then(r => {
     r.results.forEach(m => P.rec.set(m.id, (P.rec.get(m.id) || 0) + 1));
     if (genre) r.results = r.results.filter(m => m.genre_ids.includes(+genre));
@@ -145,13 +148,17 @@ async function forYou() {
   const seen = new Set(), cands = [];
   for (const r of await Promise.allSettled(reqs))
     if (r.status === 'fulfilled') for (const m of r.value.results)
-      if (!seen.has(m.id) && !S.ratings[m.id] && m.poster_path) { seen.add(m.id); cands.push(m) }
+      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && m.poster_path) { seen.add(m.id); cands.push(m) }
   cands.forEach(m => m.score = score(m, P));
   cands.sort((a, b) => b.score - a.score);
   const top = cands.slice(0, 50);
   await Promise.all(top.map(m => getWhere(m.id)));
+  const delta = lastCount === null ? 0 : P.count - lastCount;
+  lastCount = P.count;
+  const when = new Date().toLocaleTimeString('nl-NL', {hour: '2-digit', minute: '2-digit'});
   render(top.filter(m => onMyServices(m.id)).slice(0, 24).map(m => ({...m, match: P.count >= 3 ? matchPct(m.score) : null})),
-    P.count < 3 ? '👍 / 👎 a few movies you know (or search one) and this starts learning your taste.' : '');
+    P.count < 3 ? '👍 / 👎 a few movies you know (or search one) and this starts learning your taste.'
+      : `✓ Updated ${when} · based on ${P.count} ratings` + (delta > 0 ? ` (${delta} new since last picks)` : '') + (round ? ` · set ${round + 1}` : ''));
 }
 
 async function listTab(obj, empty) {
@@ -208,7 +215,7 @@ function act(m, a) {
 
 async function show() {
   document.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#genres').hidden = $('#surprise').hidden = tab !== 'foryou';
+  $('#genres').hidden = $('#surprise').hidden = $('#regen').hidden = tab !== 'foryou';
   try {
     if (tab === 'foryou') await forYou();
     else if (tab === 'watch') await listTab(S.watch, 'Nothing saved yet — hit “+ List” on anything.');
@@ -245,6 +252,12 @@ $('#genres').onclick = e => {
 $('#search').onsubmit = e => {
   e.preventDefault(); const q = $('#q').value.trim(); if (!q) return;
   tab = 'search'; show(); search(q).catch(err => status(err.message));
+};
+$('#regen').onclick = async e => {
+  const b = e.target; b.disabled = true; b.textContent = '⏳ Finding…';
+  try { await forYou(true) } catch (err) { status('Could not reach TMDB: ' + err.message) }
+  b.disabled = false; b.textContent = '🔄 New picks';
+  window.scrollTo({top: 0, behavior: 'smooth'});
 };
 $('#surprise').onclick = () => {
   const cards = [...document.querySelectorAll('.card')].slice(0, 8); if (!cards.length) return;
