@@ -146,7 +146,7 @@ dialog[open]{animation:pop .22s ease}
 .toggle .i{width:16px;height:16px;opacity:0}
 .toggle.on{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 16%,var(--s2))}
 .toggle.on .i{opacity:1;color:var(--acc)}
-.dlg .seg{width:max-content;max-width:100%;overflow-x:auto}
+.dlg .seg{width:max-content;max-width:100%;flex-wrap:wrap;border-radius:18px}
 .field{margin-top:18px}
 .field label{display:block;font-weight:600;margin-bottom:4px}
 .field p{margin:0 0 8px;color:var(--mute);font-size:13px}
@@ -341,8 +341,10 @@ const ic = (n, cls = '') => `<svg class="i ${cls}" aria-hidden="true"><use href=
 
 // users.<name>: ratings: key -> item + {r: 2 favourite | 1 seen good | 0 seen ok | -1 seen bad, t}; watch / nope (not interested): key -> item + {t}
 // key = TMDB id for movies, 't' + id for TV (ids overlap between the two)
-const S = Object.assign({key: '', omdb: '', kind: 'movie', who: 'Harry', users: null, off: [], f: {minScore: 0, minRT: 0, maxRun: 0}},
-  JSON.parse(localStorage.getItem('movienight') || '{}'));
+const DEFAULT_F = {sort: 'match', minScore: 0, minRT: 0, maxRun: 0, era: '', lang: '', gems: 0, cert: '', seasons: 0};
+const S = Object.assign({key: '', omdb: '', kind: 'movie', who: 'Harry', users: null, off: []}, JSON.parse(localStorage.getItem('movienight') || '{}'));
+S.f = {...DEFAULT_F, ...S.f};
+const YEAR = new Date().getFullYear(), ERAS = {new: [YEAR - 2, 0], 2015: [2015, 0], 2000: [2000, 0], old: [0, 1999]}; // [from, to]
 const blank = () => ({ratings: {}, watch: {}, nope: {}});
 if (!S.users) S.users = {Harry: {...blank(), ...{ratings: S.ratings || {}, watch: S.watch || {}, nope: S.nope || {}}}, Monica: blank()}; // pre-profile data was Harry's
 delete S.ratings; delete S.watch; delete S.nope;
@@ -417,8 +419,17 @@ const fits = m => { const w = want(), has = x => m.genre_ids?.includes(+x);
   return types().includes(m.mt) && (!w.g || w.g.split('|').some(has)) && (!w.not || !w.not.split('|').some(has)) };
 // series often have no episode length on TMDB: let those through rather than hide them
 const runOK = (m, lim) => !isFinite(lim) || (info[key(m)]?.runtime ? info[key(m)].runtime <= lim : m.mt === 'tv');
-const passes = m => fits(m) && (!S.f.minScore || m.vote_average >= S.f.minScore) && runOK(m, maxRun())
-  && (!S.f.minRT || !S.omdb || RT[key(m)] >= S.f.minRT);
+// filters that only need list data; "people also liked" picks skip TMDB's own filtering, so everything is re-checked here
+function fOK(m) {
+  const y = +year(m), e = ERAS[S.f.era], l = m.original_language;
+  return (!e || ((!e[0] || y >= e[0]) && (!e[1] || y <= e[1])))
+    && (!S.f.lang || (S.f.lang === 'nosubs' ? ['en', 'nl'].includes(l) : S.f.lang === 'world' ? l !== 'en' : l === S.f.lang))
+    && (!S.f.gems || (m.vote_count <= 1500 && m.vote_average >= 7))
+    && (!S.f.cert || m.mt === 'tv' || !m.fromRec); // age rating can only be checked by TMDB, so unverified picks drop out
+}
+const seasonsOK = m => !S.f.seasons || m.mt !== 'tv' || (info[key(m)]?.seasons && info[key(m)].seasons <= S.f.seasons);
+const rtOK = m => !S.f.minRT || !S.omdb || RT[key(m)] >= S.f.minRT;
+const passes = m => fits(m) && fOK(m) && seasonsOK(m) && (!S.f.minScore || m.vote_average >= S.f.minScore) && runOK(m, maxRun()) && rtOK(m);
 const onMyServices = m => info[key(m)]?.list.some(p => activeIds().includes(p.provider_id));
 
 // --- Learning: taste profile built from everything the active profile(s) rated / saved ---
@@ -453,6 +464,12 @@ function discoverBase(mt, w, run, minScore) {
   if (w.not) b.without_genres = w.not;
   if (minScore) b['vote_average.gte'] = minScore;
   if (isFinite(run)) b['with_runtime.lte'] = run;
+  const e = ERAS[S.f.era], df = mt === 'tv' ? 'first_air_date' : 'primary_release_date';
+  if (e?.[0]) b[df + '.gte'] = e[0] + '-01-01';
+  if (e?.[1]) b[df + '.lte'] = e[1] + '-12-31';
+  if (['en', 'nl'].includes(S.f.lang)) b.with_original_language = S.f.lang;
+  if (S.f.gems) { b['vote_count.lte'] = 1500; b['vote_average.gte'] = Math.max(minScore || 0, 7) }
+  if (S.f.cert && mt === 'movie') { b.certification_country = 'NL'; b['certification.lte'] = S.f.cert } // Kijkwijzer
   return b;
 }
 const discover = (mt, p) => tmdb(`/discover/${mt}`, p).then(r => r.results.map(x => norm(x, mt)));
@@ -470,14 +487,15 @@ async function forYou(fresh = false) {
     if (!w.g && P.topGenres.length) reqs.push(discover(mt, {...base, with_genres: P.topGenres.slice(0, 3).join('|'), sort_by: 'popularity.desc', page: 1 + round}));
   }
   for (const m of P.liked.slice(0, 6)) reqs.push(tmdb(`/${m.mt}/${m.id}/recommendations`).then(r => r.results.map(x => {
-    const n = norm(x, m.mt); P.rec.set(key(n), (P.rec.get(key(n)) || 0) + m.r); return n;
+    const n = {...norm(x, m.mt), fromRec: true}; P.rec.set(key(n), (P.rec.get(key(n)) || 0) + m.r); return n;
   })));
   const seen = new Set(), cands = [];
   for (const r of await Promise.allSettled(reqs))
     if (r.status === 'fulfilled') for (const m of r.value)
       if (!seen.has(key(m)) && !past.has(key(m)) && !rated(m) && m.poster_path && m.vote_count >= minVotes(m.mt) && fits(m)) { seen.add(key(m)); cands.push(m) }
   cands.forEach(m => m.score = score(m, P));
-  cands.sort((a, b) => b.score - a.score);
+  const SORT = {rating: (a, b) => b.vote_average - a.vote_average || b.score - a.score, new: (a, b) => (b.release_date || '').localeCompare(a.release_date || '') || b.score - a.score};
+  cands.sort(SORT[S.f.sort] || ((a, b) => b.score - a.score));
   // check availability in batches down the ranked list until 24 fit; "people also liked" picks are often not on your services
   const ok = [];
   for (let i = 0; i < Math.min(cands.length, 200) && ok.length < 24; i += 25) {
@@ -488,6 +506,7 @@ async function forYou(fresh = false) {
     ok.push(...avail.filter(passes));
   }
   ok.splice(24);
+  if (S.f.sort === 'short') ok.sort(byLength);
   await Promise.all(ok.map(getRT));
   if (my !== gen) return; // a newer load started (filter changed mid-way)
   const delta = lastCount === null ? 0 : P.count - lastCount;
@@ -499,11 +518,17 @@ async function forYou(fresh = false) {
       : `Updated ${when} · based on ${P.count} ratings` + (delta > 0 ? ` · ${delta} new since last picks` : '') + (round ? ` · set ${round + 1}` : ''));
 }
 
+const byLength = (a, b) => (info[key(a)]?.runtime || 999) - (info[key(b)]?.runtime || 999);
+const LIST_SORT = {match: (a, b) => b.t - a.t, rating: (a, b) => b.vote_average - a.vote_average, new: (a, b) => (b.release_date || '').localeCompare(a.release_date || ''), short: byLength};
+// watchlist: the filters answer "what on our list fits tonight?"
+const listOK = m => fOK(m) && seasonsOK(m) && (!S.f.minScore || m.vote_average >= S.f.minScore) && runOK(m, S.f.maxRun || Infinity) && rtOK(m) && (!S.off.length || onMyServices(m));
 async function listTab(obj, empty) {
-  const my = ++gen, list = Object.values(obj).map(stored).filter(m => kindOf(m) === S.kind).sort((a, b) => b.t - a.t);
-  if (list.length) loading(Math.min(list.length, 12));
-  await Promise.all(list.map(m => getInfo(m).then(() => getRT(m))));
-  if (my === gen) render(list, list.length ? `${list.length} ${KIND_NAMES[S.kind]}` : empty);
+  const my = ++gen, all = Object.values(obj).map(stored).filter(m => kindOf(m) === S.kind);
+  if (all.length) loading(Math.min(all.length, 12));
+  await Promise.all(all.map(m => getInfo(m).then(() => getRT(m))));
+  const list = (tab === 'watch' ? all.filter(listOK) : all).sort(tab === 'watch' ? LIST_SORT[S.f.sort] : LIST_SORT.match);
+  if (my === gen) render(list, list.length ? `${list.length} ${KIND_NAMES[S.kind]}` + (list.length < all.length ? ` · ${all.length - list.length} hidden by filters` : '')
+    : all.length ? 'Nothing on the watchlist matches these filters' : empty);
 }
 
 async function search(q) {
@@ -617,15 +642,22 @@ function renderDetail() {
 }
 
 // --- filters sheet ---
-const activeFilters = () => S.off.length + ['minScore', 'minRT', 'maxRun'].filter(k => S.f[k]).length;
+const activeFilters = () => S.off.length + Object.keys(DEFAULT_F).filter(k => k !== 'sort' && S.f[k] !== DEFAULT_F[k]).length;
 function renderFilters() {
   const seg = (k, opts) => `<div class="seg">${opts.map(([v, t]) => `<button data-f="${k}" data-v="${v}" class="${S.f[k] == v ? 'on' : ''}">${t}</button>`).join('')}</div>`;
+  const tv = S.kind === 'tv', movie = S.kind === 'movie';
   $('#filterBody').innerHTML = `
+    <h4>Sort by</h4>${seg('sort', [['match', tab === 'watch' ? 'Recently added' : 'Best match'], ['rating', 'Top rated'], ['new', 'Newest'], ['short', 'Shortest']])}
     <h4>Your services</h4>
     <div class="toggles">${Object.keys(SERVICES).map(s => `<button class="toggle ${S.off.includes(s) ? '' : 'on'}" data-svc="${s}" aria-pressed="${!S.off.includes(s)}">${ic('check')}${s}</button>`).join('')}</div>
     <h4>Minimum rating</h4>${seg('minScore', [[0, 'Any'], [6, '6+'], [7, '7+'], [7.5, '7.5+'], [8, '8+']])}
     <h4>Rotten Tomatoes</h4>${S.omdb ? seg('minRT', [[0, 'Any'], [60, '60%+'], [70, '70%+'], [80, '80%+'], [90, '90%+']]) : '<p class="hint">Add a free OMDb key in Settings to filter by Rotten Tomatoes.</p>'}
-    <h4>${S.kind === 'tv' ? 'Episode length' : 'Length'}</h4>${seg('maxRun', S.kind === 'tv' ? [[0, 'Any'], [30, '≤ 30m'], [45, '≤ 45m'], [60, '≤ 1h']] : [[0, 'Any'], [90, '≤ 1h30'], [105, '≤ 1h45'], [120, '≤ 2h'], [150, '≤ 2h30']])}`;
+    <h4>Discover</h4>${seg('gems', [[0, 'Everything'], [1, '💎 Hidden gems']])}<p class="hint">Hidden gems: rated 7+ but seen by fewer people.</p>
+    <h4>Released</h4>${seg('era', [['', 'Any time'], ['new', 'Last 2 years'], [2015, 'Since 2015'], [2000, 'Since 2000'], ['old', 'Before 2000']])}
+    <h4>${tv ? 'Episode length' : 'Length'}</h4>${seg('maxRun', tv ? [[0, 'Any'], [30, '≤ 30m'], [45, '≤ 45m'], [60, '≤ 1h']] : [[0, 'Any'], [90, '≤ 1h30'], [105, '≤ 1h45'], [120, '≤ 2h'], [150, '≤ 2h30']])}
+    ${tv ? `<h4>Commitment</h4>${seg('seasons', [[0, 'Any'], [1, '1 season'], [2, '≤ 2 seasons'], [3, '≤ 3 seasons']])}` : ''}
+    <h4>Language</h4>${seg('lang', [['', 'Any'], ['en', 'English'], ['nl', 'Dutch'], ['nosubs', 'No subtitles'], ['world', 'World cinema']])}
+    ${movie ? `<h4>Age rating (Kijkwijzer)</h4>${seg('cert', [['', 'Any'], [6, 'Kids · 6 and under'], [12, 'Family · 12 and under']])}` : ''}`;
   const n = activeFilters(); $('#fcount').hidden = !n; $('#fcount').textContent = n;
 }
 function filtersChanged() { save(); restart(); renderFilters(); show() }
@@ -643,9 +675,9 @@ const REASONS = [
   ['🤷 Just not this one', (m, T) => (m.genre_ids || []).forEach(g => T.g[g] = (T.g[g] || 0) - 0.5)],
 ];
 const banned = () => Object.keys(T.g).filter(g => T.g[g] <= -2); // a genre turned down twice is out for the night
-const tCheap = m => !T.done.has(key(m)) && !rated(m) && fits(m) && !banned().some(g => m.genre_ids?.includes(+g)) && (m.vote_average || 0) >= T.minScore
+const tCheap = m => !T.done.has(key(m)) && !rated(m) && fits(m) && fOK(m) && !banned().some(g => m.genre_ids?.includes(+g)) && (m.vote_average || 0) >= T.minScore
   && +year(m) >= T.minYear && (T.subs || ['en', 'nl'].includes(m.original_language));
-const tFull = m => onMyServices(m) && runOK(m, T.maxRun) && (!S.f.minRT || !S.omdb || RT[key(m)] >= S.f.minRT);
+const tFull = m => onMyServices(m) && runOK(m, T.maxRun) && seasonsOK(m) && rtOK(m);
 const tScore = m => score(m, T.P) + (m.genre_ids || []).reduce((a, g) => a + (T.g[g] || 0), 0);
 
 async function tonightStart() {
@@ -660,7 +692,8 @@ async function tonightFill() {
   let fetched = 0;
   for (const mt of types()) {
     const base = discoverBase(mt, {...w, not: [w.not, ...banned()].filter(Boolean).join('|')}, T.maxRun, T.minScore);
-    if (T.minYear) base[mt === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = T.minYear + '-01-01';
+    const yf = mt === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte';
+    if (T.minYear > parseInt(base[yf] || 0)) base[yf] = T.minYear + '-01-01';
     const qk = mt + JSON.stringify(base), p = T.pages[qk] = (T.pages[qk] || 0) + 1; // next page of this exact query
     for (const r of await Promise.allSettled([
       discover(mt, {...base, sort_by: 'popularity.desc', page: p}),
@@ -726,7 +759,8 @@ async function show() {
   document.querySelectorAll('[data-tab]').forEach(b => { b.classList.toggle('on', b.dataset.tab === tab); b.toggleAttribute('aria-current', b.dataset.tab === tab) });
   const tonight = tab === 'tonight', picks = ['foryou', 'tonight'].includes(tab);
   document.body.classList.toggle('tonight', tonight);
-  $('#filterBtn').hidden = !picks;
+  $('#filterBtn').hidden = !picks && tab !== 'watch';
+  renderFilters();
   $('#genres').hidden = !picks || S.kind === 'doc';
   $('#surprise').hidden = $('#regen').hidden = tab !== 'foryou';
   $('#grid').hidden = $('#head').hidden = $('#status').hidden = tonight; $('#tonight').hidden = !tonight;
@@ -774,11 +808,11 @@ $('#filterBody').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   const {svc, f, v} = b.dataset;
   if (svc) S.off = S.off.includes(svc) ? S.off.filter(x => x !== svc) : [...S.off, svc];
-  else if (f) S.f[f] = +v;
+  else if (f) S.f[f] = v === '' || isNaN(v) ? v : +v;
   else return;
   filtersChanged();
 });
-$('#freset').onclick = () => { S.off = []; S.f = {minScore: 0, minRT: 0, maxRun: 0}; filtersChanged() };
+$('#freset').onclick = () => { S.off = []; S.f = {...DEFAULT_F}; filtersChanged() };
 $('#genres').onclick = e => {
   const g = e.target.closest('[data-g]')?.dataset.g; if (g === undefined) return;
   pick = g; restart(); chrome(); show();
