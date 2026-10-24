@@ -227,14 +227,16 @@ function card(m) {
   const logos = w.list.map(p => `<a href="${esc(w.link)}" target="_blank" rel="noopener" title="${esc(p.provider_name)}"><img src="${IMG}w92${p.logo_path}" alt="${esc(p.provider_name)}"></a>`).join('')
     || '<span class="mute">Not on your services</span>';
   const yt = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(`${m.title} ${(m.release_date || '').slice(0, 4)} trailer`);
+  // ponytail: RT search page, not the exact film page (OMDb doesn't give RT links); first result is nearly always it
+  const rt = 'https://www.rottentomatoes.com/search?search=' + encodeURIComponent(m.title);
   return `<article class="card" data-id="${m.id}">
     <img class="poster" loading="lazy" src="${IMG}w342${m.poster_path}" alt="${esc(m.title)} poster">
     <div class="info">
       <b>${esc(m.title)}</b>
-      <span class="mute">${(m.release_date || '').slice(0, 4)} · ★ ${(m.vote_average || 0).toFixed(1)}${RT[m.id] ? ` · 🍅 ${RT[m.id]}%` : ''}${len}${m.match ? ` · <span class="match">${m.match}% match</span>` : ''}</span>
+      <span class="mute">${(m.release_date || '').slice(0, 4)} · ★ ${(m.vote_average || 0).toFixed(1)}${RT[m.id] ? ` · <a href="${rt}" target="_blank" rel="noopener">🍅 ${RT[m.id]}%</a>` : ''}${len}${m.match ? ` · <span class="match">${m.match}% match</span>` : ''}</span>
       <span class="mute">${(m.genre_ids || []).slice(0, 2).map(x => genres[x]).join(', ')}</span>
       <div class="prov">${logos}</div>
-      <details><summary>About</summary>${esc(m.overview)} <a href="${yt}" target="_blank" rel="noopener">▶ Trailer</a></details>
+      <details><summary>About</summary>${esc(m.overview)} <a href="${yt}" target="_blank" rel="noopener">▶ Trailer</a> · <a href="${rt}" target="_blank" rel="noopener">🍅 Reviews</a></details>
       <div class="acts">
         <button data-a="2" class="${r === 2 ? 'on' : ''}" aria-label="Favourite, would watch again">❤️ Fav</button>
         <button data-a="1" class="${r === 1 ? 'on' : ''}" aria-label="Seen it, good">Seen 👍</button>
