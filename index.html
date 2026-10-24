@@ -17,6 +17,7 @@ button{background:var(--card);border:1px solid var(--line);border-radius:999px;p
 button.on{background:var(--acc);color:#000;border-color:var(--acc)}
 input,textarea{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
 #q{flex:1;min-width:140px}
+select{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 10px}
 .chips{overflow-x:auto;flex-wrap:nowrap;padding:8px 0 2px;scrollbar-width:none}
 .chips::-webkit-scrollbar{display:none}
 .chips button{white-space:nowrap;font-size:13px}
@@ -50,12 +51,15 @@ summary{cursor:pointer;color:var(--mute)}
   </div>
   <form id="search" class="row" style="margin-top:8px"><input id="q" type="search" placeholder="Search a movie to rate or add…"></form>
   <div id="services" class="row" style="margin-top:8px"></div>
+  <div id="filters" class="row" style="margin-top:8px"></div>
   <div id="genres" class="row chips"></div>
 </header>
 <main>
   <section id="settings" hidden>
     <div><b>TMDB key</b> <span class="mute">(free: themoviedb.org → Settings → API; v3 key or read-access token)</span>
       <form id="keyform" class="row"><input id="key" autocomplete="off"><button>Save</button></form></div>
+    <div><b>OMDb key</b> <span class="mute">for 🍅 Rotten Tomatoes scores (free: omdbapi.com/apikey.aspx, 1,000 lookups/day)</span>
+      <form id="omdbform" class="row"><input id="omdb" autocomplete="off"><button>Save</button></form></div>
     <div><b>Sync phone ↔ computer</b> <span class="mute">copy on one device, paste + Load on the other</span>
       <textarea id="sync" rows="3"></textarea>
       <div class="row"><button id="copy">Copy my taste</button><button id="load">Load</button></div></div>
@@ -66,16 +70,30 @@ summary{cursor:pointer;color:var(--mute)}
 <script>
 const API = 'https://api.themoviedb.org/3', IMG = 'https://image.tmdb.org/t/p/';
 const SERVICES = {'Netflix': /netflix/i, 'Prime Video': /amazon prime/i, 'Apple TV': /apple tv/i, 'HBO Max': /hbo|^max$/i};
+// Moods: genre ids to include (any of) / exclude, optional max length in minutes
+const MOODS = {
+  '😂 Light & funny': {g: '35', not: '27|53|10752|18'},
+  '🛋️ Easy, nothing heavy': {g: '35|10751|16|10749', not: '27|53|10752', run: 110},
+  '💕 Romantic': {g: '10749'},
+  '💥 Action-packed': {g: '28|12', not: '16|10751'},
+  '🕵️ Gripping': {g: '80|53|9648', not: '35|16'},
+  '🧠 Mind-bending': {g: '878|9648', not: '16|10751'},
+  '😱 Scary': {g: '27'},
+  '😢 Moving': {g: '18', not: '35|27|28'},
+  '🌍 True stories': {g: '99|36'},
+  '👨‍👩‍👧 Family': {g: '10751|16', not: '27'},
+};
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 
 // ratings: id -> movie + {r: 2 favourite | 1 seen good | 0 seen ok | -1 seen bad, t: timestamp}; watch: id -> movie + {t}
-const S = Object.assign({key: '', ratings: {}, watch: {}, off: []}, JSON.parse(localStorage.getItem('movienight') || '{}'));
+const S = Object.assign({key: '', omdb: '', ratings: {}, watch: {}, off: [], f: {minScore: 0, minRT: 0, maxRun: 0}}, JSON.parse(localStorage.getItem('movienight') || '{}'));
 const save = () => localStorage.setItem('movienight', JSON.stringify(S));
 
-let genres = {}, myProv = [], tab = 'foryou', genre = '', shown = new Map();
+let genres = {}, myProv = [], tab = 'foryou', pick = '', shown = new Map();
 let round = 0, lastCount = null; const past = new Set(); // "New picks": skip what you've already been shown
-const where = {}; // id -> {list, link}, in-memory cache
+const info = {}; // id -> {list, link, runtime, imdb}, in-memory cache
+const RT = JSON.parse(localStorage.getItem('movienight-rt') || '{}'); // id -> Rotten Tomatoes % (null = none), kept between visits
 
 async function tmdb(path, params = {}) {
   const u = new URL(API + path);
@@ -90,19 +108,38 @@ async function tmdb(path, params = {}) {
 const activeIds = () => myProv.filter(p => !S.off.includes(serviceOf(p.provider_name))).map(p => p.provider_id);
 const serviceOf = name => Object.keys(SERVICES).find(k => SERVICES[k].test(name));
 
-async function getWhere(id) {
-  if (!where[id]) {
+async function getInfo(id) {
+  if (!info[id]) {
     try {
-      const nl = (await tmdb(`/movie/${id}/watch/providers`)).results.NL || {};
+      const d = await tmdb(`/movie/${id}`, {append_to_response: 'watch/providers'});
+      const nl = d['watch/providers'].results.NL || {};
       const mine = myProv.map(p => p.provider_id);
       const list = (nl.flatrate || []).filter(p => mine.includes(p.provider_id));
       // one logo per service (e.g. "HBO Max" and "HBO Max Amazon Channel" are the same)
-      where[id] = {list: list.filter((p, i) => list.findIndex(q => serviceOf(q.provider_name) === serviceOf(p.provider_name)) === i), link: nl.link};
-    } catch { where[id] = {list: []} }
+      info[id] = {list: list.filter((p, i) => list.findIndex(q => serviceOf(q.provider_name) === serviceOf(p.provider_name)) === i), link: nl.link, runtime: d.runtime, imdb: d.imdb_id};
+    } catch { info[id] = {list: []} }
   }
-  return where[id];
+  return info[id];
 }
-const onMyServices = id => where[id]?.list.some(p => activeIds().includes(p.provider_id));
+async function getRT(id) {
+  if (id in RT || !S.omdb || !info[id]?.imdb) return RT[id];
+  try {
+    const d = await (await fetch(`https://www.omdbapi.com/?i=${info[id].imdb}&apikey=${encodeURIComponent(S.omdb)}`)).json();
+    if (d.Response === 'False' && d.Error !== 'Incorrect IMDb ID.') return; // key/limit problem: don't cache, try again later
+    RT[id] = parseInt(d.Ratings?.find(r => r.Source === 'Rotten Tomatoes')?.Value) || null;
+    localStorage.setItem('movienight-rt', JSON.stringify(RT));
+  } catch {}
+  return RT[id];
+}
+// what's selected in the chips row: a mood, a single genre, or nothing
+const want = () => pick.startsWith('g') ? {g: pick.slice(1)} : MOODS[pick] || {};
+const maxRun = () => Math.min(...[S.f.maxRun, want().run].filter(Boolean)); // Infinity = no limit
+const fits = m => { const w = want(), has = x => m.genre_ids?.includes(+x);
+  return (!w.g || w.g.split('|').some(has)) && (!w.not || !w.not.split('|').some(has)) };
+const passes = m => fits(m) && (!S.f.minScore || m.vote_average >= S.f.minScore)
+  && (!isFinite(maxRun()) || (info[m.id]?.runtime && info[m.id].runtime <= maxRun()))
+  && (!S.f.minRT || !S.omdb || RT[m.id] >= S.f.minRT);
+const onMyServices = id => info[id]?.list.some(p => activeIds().includes(p.provider_id));
 
 // --- Learning: taste profile built from everything you rated / saved ---
 function profile() {
@@ -136,34 +173,42 @@ async function forYou(fresh = false) {
   const P = profile();
   if (fresh) { round++; shown.forEach((_, id) => past.add(id)) }
   const base = {watch_region: 'NL', with_watch_providers: ids.join('|'), with_watch_monetization_types: 'flatrate', 'vote_count.gte': 150};
-  if (genre) base.with_genres = genre;
+  const w = want();
+  if (w.g) base.with_genres = w.g;
+  if (w.not) base.without_genres = w.not;
+  if (S.f.minScore) base['vote_average.gte'] = S.f.minScore;
+  if (isFinite(maxRun())) base['with_runtime.lte'] = maxRun();
   const reqs = [1, 2, 3].map(p => tmdb('/discover/movie', {...base, sort_by: 'popularity.desc', page: p + 3 * round}));
   reqs.push(tmdb('/discover/movie', {...base, sort_by: 'vote_average.desc', 'vote_count.gte': 1500, page: 1 + round}));
-  if (!genre && P.topGenres.length) reqs.push(tmdb('/discover/movie', {...base, with_genres: P.topGenres.slice(0, 3).join('|'), sort_by: 'popularity.desc', page: 1 + round}));
+  if (!w.g && P.topGenres.length) reqs.push(tmdb('/discover/movie', {...base, with_genres: P.topGenres.slice(0, 3).join('|'), sort_by: 'popularity.desc', page: 1 + round}));
   for (const [id, w] of P.liked.slice(0, 6)) reqs.push(tmdb(`/movie/${id}/recommendations`).then(r => {
     r.results.forEach(m => P.rec.set(m.id, (P.rec.get(m.id) || 0) + w));
-    if (genre) r.results = r.results.filter(m => m.genre_ids.includes(+genre));
     return r;
   }));
   const seen = new Set(), cands = [];
   for (const r of await Promise.allSettled(reqs))
     if (r.status === 'fulfilled') for (const m of r.value.results)
-      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && m.poster_path) { seen.add(m.id); cands.push(m) }
+      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && m.poster_path && fits(m)) { seen.add(m.id); cands.push(m) }
   cands.forEach(m => m.score = score(m, P));
   cands.sort((a, b) => b.score - a.score);
   const top = cands.slice(0, 50);
-  await Promise.all(top.map(m => getWhere(m.id)));
+  await Promise.all(top.map(m => getInfo(m.id)));
+  let ok = top.filter(m => onMyServices(m.id));
+  if (S.f.minRT) await Promise.all(ok.map(m => getRT(m.id))); // ponytail: RT filter costs ~50 OMDb lookups per fresh list (cached after)
+  ok = ok.filter(passes).slice(0, 24);
+  await Promise.all(ok.map(m => getRT(m.id)));
   const delta = lastCount === null ? 0 : P.count - lastCount;
   lastCount = P.count;
   const when = new Date().toLocaleTimeString('nl-NL', {hour: '2-digit', minute: '2-digit'});
-  render(top.filter(m => onMyServices(m.id)).slice(0, 24).map(m => ({...m, match: P.count >= 3 ? matchPct(m.score) : null})),
-    P.count < 3 ? '👍 / 👎 a few movies you know (or search one) and this starts learning your taste.'
+  render(ok.map(m => ({...m, match: P.count >= 3 ? matchPct(m.score) : null})),
+    !ok.length ? 'Nothing matches these filters — loosen them a bit.'
+      : P.count < 3 ? '👍 / 👎 a few movies you know (or search one) and this starts learning your taste.'
       : `✓ Updated ${when} · based on ${P.count} ratings` + (delta > 0 ? ` (${delta} new since last picks)` : '') + (round ? ` · set ${round + 1}` : ''));
 }
 
 async function listTab(obj, empty) {
   const list = Object.values(obj).sort((a, b) => b.t - a.t);
-  await Promise.all(list.map(m => getWhere(m.id)));
+  await Promise.all(list.map(m => getInfo(m.id).then(() => getRT(m.id))));
   render(list, list.length ? '' : empty);
 }
 
@@ -171,12 +216,13 @@ async function search(q) {
   status('Searching…');
   const r = await tmdb('/search/movie', {query: q, region: 'NL'});
   const list = r.results.filter(m => m.poster_path).slice(0, 20);
-  await Promise.all(list.map(m => getWhere(m.id)));
+  await Promise.all(list.map(m => getInfo(m.id).then(() => getRT(m.id))));
   render(list, list.length ? 'Rate what you have seen — it trains For you.' : 'Nothing found.');
 }
 
 function card(m) {
-  const w = where[m.id] || {list: []}, r = S.ratings[m.id]?.r;
+  const w = info[m.id] || {list: []}, r = S.ratings[m.id]?.r;
+  const len = w.runtime ? ` · ${Math.floor(w.runtime / 60)}h ${String(w.runtime % 60).padStart(2, '0')}m` : '';
   const logos = w.list.map(p => `<a href="${esc(w.link)}" target="_blank" rel="noopener" title="${esc(p.provider_name)}"><img src="${IMG}w92${p.logo_path}" alt="${esc(p.provider_name)}"></a>`).join('')
     || '<span class="mute">Not on your services</span>';
   const yt = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(`${m.title} ${(m.release_date || '').slice(0, 4)} trailer`);
@@ -184,7 +230,7 @@ function card(m) {
     <img class="poster" loading="lazy" src="${IMG}w342${m.poster_path}" alt="${esc(m.title)} poster">
     <div class="info">
       <b>${esc(m.title)}</b>
-      <span class="mute">${(m.release_date || '').slice(0, 4)} · ★ ${(m.vote_average || 0).toFixed(1)}${m.match ? ` · <span class="match">${m.match}% match</span>` : ''}</span>
+      <span class="mute">${(m.release_date || '').slice(0, 4)} · ★ ${(m.vote_average || 0).toFixed(1)}${RT[m.id] ? ` · 🍅 ${RT[m.id]}%` : ''}${len}${m.match ? ` · <span class="match">${m.match}% match</span>` : ''}</span>
       <span class="mute">${(m.genre_ids || []).slice(0, 2).map(x => genres[x]).join(', ')}</span>
       <div class="prov">${logos}</div>
       <details><summary>About</summary>${esc(m.overview)} <a href="${yt}" target="_blank" rel="noopener">▶ Trailer</a></details>
@@ -216,7 +262,7 @@ function act(m, a) {
 
 async function show() {
   document.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#genres').hidden = $('#surprise').hidden = $('#regen').hidden = tab !== 'foryou';
+  $('#genres').hidden = $('#filters').hidden = $('#surprise').hidden = $('#regen').hidden = tab !== 'foryou';
   try {
     if (tab === 'foryou') await forYou();
     else if (tab === 'watch') await listTab(S.watch, 'Nothing saved yet — hit “+ List” on anything.');
@@ -227,8 +273,15 @@ async function show() {
 function chrome() {
   $('#services').innerHTML = Object.keys(SERVICES).map(s =>
     `<button data-svc="${s}" class="${S.off.includes(s) ? '' : 'on'}">${s}</button>`).join('');
-  $('#genres').innerHTML = `<button data-g="" class="${genre ? '' : 'on'}">All</button>` +
-    Object.entries(genres).map(([id, n]) => `<button data-g="${id}" class="${genre === id ? 'on' : ''}">${esc(n)}</button>`).join('');
+  const sel = (k, label, opts) => `<select data-f="${k}" aria-label="${label}">` +
+    opts.map(([v, t]) => `<option value="${v}" ${S.f[k] == v ? 'selected' : ''}>${t}</option>`).join('') + '</select>';
+  $('#filters').innerHTML =
+    sel('minScore', 'Minimum TMDB rating', [[0, '★ any'], [6, '★ 6+'], [6.5, '★ 6.5+'], [7, '★ 7+'], [7.5, '★ 7.5+'], [8, '★ 8+']]) +
+    (S.omdb ? sel('minRT', 'Minimum Rotten Tomatoes', [[0, '🍅 any'], [60, '🍅 60%+'], [70, '🍅 70%+'], [80, '🍅 80%+'], [90, '🍅 90%+']]) : '') +
+    sel('maxRun', 'Maximum length', [[0, '⏱ any length'], [90, '⏱ ≤ 1h30'], [105, '⏱ ≤ 1h45'], [120, '⏱ ≤ 2h'], [150, '⏱ ≤ 2h30']]);
+  const chip = (k, t) => `<button data-g="${esc(k)}" class="${pick === k ? 'on' : ''}">${esc(t)}</button>`;
+  $('#genres').innerHTML = chip('', 'Anything') + Object.keys(MOODS).map(k => chip(k, k)).join('')
+    + '<span class="mute">│</span>' + Object.entries(genres).map(([id, n]) => chip('g' + id, n)).join('');
 }
 
 // --- events ---
@@ -246,9 +299,10 @@ $('#services').onclick = e => {
   S.off = S.off.includes(s) ? S.off.filter(x => x !== s) : [...S.off, s];
   save(); chrome(); show();
 };
+$('#filters').onchange = e => { S.f[e.target.dataset.f] = +e.target.value; save(); show() };
 $('#genres').onclick = e => {
   if (e.target.dataset.g === undefined) return;
-  genre = e.target.dataset.g; chrome(); show();
+  pick = e.target.dataset.g; chrome(); show();
 };
 $('#search').onsubmit = e => {
   e.preventDefault(); const q = $('#q').value.trim(); if (!q) return;
@@ -267,6 +321,7 @@ $('#surprise').onclick = () => {
   c.classList.add('flash'); c.scrollIntoView({behavior: 'smooth', block: 'center'});
 };
 $('#gear').onclick = () => $('#settings').hidden = !$('#settings').hidden;
+$('#omdbform').onsubmit = e => { e.preventDefault(); S.omdb = $('#omdb').value.trim(); save(); chrome(); show() };
 $('#keyform').onsubmit = e => { e.preventDefault(); S.key = $('#key').value.trim(); save(); init() };
 $('#copy').onclick = () => {
   $('#sync').value = JSON.stringify({ratings: S.ratings, watch: S.watch, off: S.off});
@@ -278,7 +333,7 @@ $('#load').onclick = () => {
 };
 
 async function init() {
-  $('#key').value = S.key;
+  $('#key').value = S.key; $('#omdb').value = S.omdb;
   if (!S.key) { $('#settings').hidden = false; return status('Add a free TMDB key to start (⚙︎ Settings).') }
   try {
     const [g, p] = await Promise.all([tmdb('/genre/movie/list'), tmdb('/watch/providers/movie', {watch_region: 'NL'})]);
