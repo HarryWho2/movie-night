@@ -91,16 +91,17 @@ const S = Object.assign({key: '', omdb: '', ratings: {}, watch: {}, nope: {}, of
 const save = () => localStorage.setItem('movienight', JSON.stringify(S));
 
 let genres = {}, myProv = [], tab = 'foryou', pick = '', shown = new Map();
-let round = 0, lastCount = null; const past = new Set(); // "New picks": skip what you've already been shown
+let round = 0, lastCount = null, gen = 0; const past = new Set(); // "New picks": skip what you've already been shown
 const info = {}; // id -> {list, link, runtime, imdb}, in-memory cache
 const RT = JSON.parse(localStorage.getItem('movienight-rt') || '{}'); // id -> Rotten Tomatoes % (null = none), kept between visits
 
-async function tmdb(path, params = {}) {
+async function tmdb(path, params = {}, tries = 0) {
   const u = new URL(API + path);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
   const bearer = S.key.length > 40;
   if (!bearer) u.searchParams.set('api_key', S.key);
   const r = await fetch(u, {headers: bearer ? {Authorization: 'Bearer ' + S.key} : {}});
+  if (r.status === 429 && tries < 3) { await new Promise(ok => setTimeout(ok, 1000 * (tries + 1))); return tmdb(path, params, tries + 1) }
   if (!r.ok) throw new Error('TMDB ' + r.status);
   return r.json();
 }
@@ -114,10 +115,10 @@ async function getInfo(id) {
       const d = await tmdb(`/movie/${id}`, {append_to_response: 'watch/providers'});
       const nl = d['watch/providers'].results.NL || {};
       const mine = myProv.map(p => p.provider_id);
-      const list = (nl.flatrate || []).filter(p => mine.includes(p.provider_id));
+      const list = [...nl.flatrate || [], ...nl.ads || []].filter(p => mine.includes(p.provider_id));
       // one logo per service (e.g. "HBO Max" and "HBO Max Amazon Channel" are the same)
       info[id] = {list: list.filter((p, i) => list.findIndex(q => serviceOf(q.provider_name) === serviceOf(p.provider_name)) === i), link: nl.link, runtime: d.runtime, imdb: d.imdb_id};
-    } catch { info[id] = {list: []} }
+    } catch { return {list: []} } // not cached: retried next time
   }
   return info[id];
 }
@@ -171,9 +172,10 @@ async function forYou(fresh = false) {
   const ids = activeIds();
   if (!ids.length) return render([], 'Turn on at least one service.');
   status('Finding movies for you…');
+  const my = ++gen;
   const P = profile();
   if (fresh) { round++; shown.forEach((_, id) => past.add(id)) }
-  const base = {watch_region: 'NL', with_watch_providers: ids.join('|'), with_watch_monetization_types: 'flatrate', 'vote_count.gte': 150};
+  const base = {watch_region: 'NL', with_watch_providers: ids.join('|'), with_watch_monetization_types: 'flatrate|ads', 'vote_count.gte': 50};
   const w = want();
   if (w.g) base.with_genres = w.g;
   if (w.not) base.without_genres = w.not;
@@ -189,15 +191,21 @@ async function forYou(fresh = false) {
   const seen = new Set(), cands = [];
   for (const r of await Promise.allSettled(reqs))
     if (r.status === 'fulfilled') for (const m of r.value.results)
-      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && !S.nope[m.id] && m.poster_path && fits(m)) { seen.add(m.id); cands.push(m) }
+      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && !S.nope[m.id] && m.poster_path && m.vote_count >= 50 && fits(m)) { seen.add(m.id); cands.push(m) }
   cands.forEach(m => m.score = score(m, P));
   cands.sort((a, b) => b.score - a.score);
-  const top = cands.slice(0, 50);
-  await Promise.all(top.map(m => getInfo(m.id)));
-  let ok = top.filter(m => onMyServices(m.id));
-  if (S.f.minRT) await Promise.all(ok.map(m => getRT(m.id))); // ponytail: RT filter costs ~50 OMDb lookups per fresh list (cached after)
-  ok = ok.filter(passes).slice(0, 24);
+  // check availability in batches down the ranked list until 24 fit; "people also liked" picks are often not on your services
+  const ok = [];
+  for (let i = 0; i < Math.min(cands.length, 200) && ok.length < 24; i += 25) {
+    const batch = cands.slice(i, i + 25);
+    await Promise.all(batch.map(m => getInfo(m.id)));
+    const avail = batch.filter(m => onMyServices(m.id));
+    if (S.f.minRT) await Promise.all(avail.map(m => getRT(m.id))); // ponytail: RT filter can cost up to ~200 OMDb lookups per fresh list (cached after)
+    ok.push(...avail.filter(passes));
+  }
+  ok.splice(24);
   await Promise.all(ok.map(m => getRT(m.id)));
+  if (my !== gen) return; // a newer load started (filter changed mid-way)
   const delta = lastCount === null ? 0 : P.count - lastCount;
   lastCount = P.count;
   const when = new Date().toLocaleTimeString('nl-NL', {hour: '2-digit', minute: '2-digit'});
@@ -208,17 +216,17 @@ async function forYou(fresh = false) {
 }
 
 async function listTab(obj, empty) {
-  const list = Object.values(obj).sort((a, b) => b.t - a.t);
+  const my = ++gen, list = Object.values(obj).sort((a, b) => b.t - a.t);
   await Promise.all(list.map(m => getInfo(m.id).then(() => getRT(m.id))));
-  render(list, list.length ? '' : empty);
+  if (my === gen) render(list, list.length ? '' : empty);
 }
 
 async function search(q) {
-  status('Searching…');
+  status('Searching…'); const my = ++gen;
   const r = await tmdb('/search/movie', {query: q, region: 'NL'});
   const list = r.results.filter(m => m.poster_path).slice(0, 20);
   await Promise.all(list.map(m => getInfo(m.id).then(() => getRT(m.id))));
-  render(list, list.length ? 'Rate what you have seen — it trains For you.' : 'Nothing found.');
+  if (my === gen) render(list, list.length ? 'Rate what you have seen — it trains For you.' : 'Nothing found.');
 }
 
 function card(m) {
@@ -275,6 +283,7 @@ async function show() {
   } catch (e) { status('Could not reach TMDB: ' + e.message) }
 }
 
+const restart = () => { round = 0; past.clear() };
 function chrome() {
   $('#services').innerHTML = Object.keys(SERVICES).map(s =>
     `<button data-svc="${s}" class="${S.off.includes(s) ? '' : 'on'}">${s}</button>`).join('');
@@ -302,12 +311,12 @@ document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b
 $('#services').onclick = e => {
   const s = e.target.dataset.svc; if (!s) return;
   S.off = S.off.includes(s) ? S.off.filter(x => x !== s) : [...S.off, s];
-  save(); chrome(); show();
+  save(); restart(); chrome(); show();
 };
-$('#filters').onchange = e => { S.f[e.target.dataset.f] = +e.target.value; save(); show() };
+$('#filters').onchange = e => { S.f[e.target.dataset.f] = +e.target.value; save(); restart(); show() };
 $('#genres').onclick = e => {
   if (e.target.dataset.g === undefined) return;
-  pick = e.target.dataset.g; chrome(); show();
+  pick = e.target.dataset.g; restart(); chrome(); show();
 };
 $('#search').onsubmit = e => {
   e.preventDefault(); const q = $('#q').value.trim(); if (!q) return;
