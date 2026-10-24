@@ -44,7 +44,7 @@ summary{cursor:pointer;color:var(--mute)}
     <h1>🍿 Movie Night</h1>
     <button data-tab="foryou" class="on">For you</button>
     <button data-tab="watch">Watchlist</button>
-    <button data-tab="seen">Seen</button>
+    <button data-tab="seen">Seen &amp; hidden</button>
     <button id="regen">🔄 New picks</button>
     <button id="surprise">🎲 Surprise me</button>
     <button id="gear" aria-label="Settings">⚙︎</button>
@@ -86,8 +86,8 @@ const MOODS = {
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 
-// ratings: id -> movie + {r: 2 favourite | 1 seen good | 0 seen ok | -1 seen bad, t: timestamp}; watch: id -> movie + {t}
-const S = Object.assign({key: '', omdb: '', ratings: {}, watch: {}, off: [], f: {minScore: 0, minRT: 0, maxRun: 0}}, JSON.parse(localStorage.getItem('movienight') || '{}'));
+// ratings: id -> movie + {r: 2 favourite | 1 seen good | 0 seen ok | -1 seen bad, t: timestamp}; watch / nope (not interested): id -> movie + {t}
+const S = Object.assign({key: '', omdb: '', ratings: {}, watch: {}, nope: {}, off: [], f: {minScore: 0, minRT: 0, maxRun: 0}}, JSON.parse(localStorage.getItem('movienight') || '{}'));
 const save = () => localStorage.setItem('movienight', JSON.stringify(S));
 
 let genres = {}, myProv = [], tab = 'foryou', pick = '', shown = new Map();
@@ -150,6 +150,7 @@ function profile() {
   };
   rated.forEach(m => add(m, m.r));
   Object.values(S.watch).forEach(m => add(m, 0.5));
+  Object.values(S.nope).forEach(m => add(m, -0.5)); // mild: not interested ≠ watched and disliked
   return {
     g, l, rec: new Map(), n: Math.sqrt(rated.length + 1), count: rated.length,
     liked: rated.filter(m => m.r > 0).sort((a, b) => b.r - a.r || b.t - a.t).map(m => [m.id, m.r]), // favourites first
@@ -188,7 +189,7 @@ async function forYou(fresh = false) {
   const seen = new Set(), cands = [];
   for (const r of await Promise.allSettled(reqs))
     if (r.status === 'fulfilled') for (const m of r.value.results)
-      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && m.poster_path && fits(m)) { seen.add(m.id); cands.push(m) }
+      if (!seen.has(m.id) && !past.has(m.id) && !S.ratings[m.id] && !S.nope[m.id] && m.poster_path && fits(m)) { seen.add(m.id); cands.push(m) }
   cands.forEach(m => m.score = score(m, P));
   cands.sort((a, b) => b.score - a.score);
   const top = cands.slice(0, 50);
@@ -240,6 +241,7 @@ function card(m) {
         <button data-a="0" class="${r === 0 ? 'on' : ''}" aria-label="Seen it, it was ok">Seen 😐</button>
         <button data-a="-1" class="${r === -1 ? 'on' : ''}" aria-label="Seen it, bad">Seen 👎</button>
         <button data-a="w" class="${S.watch[m.id] ? 'on' : ''}">${S.watch[m.id] ? '✓ List' : '+ List'}</button>
+        <button data-a="x" class="${S.nope[m.id] ? 'on' : ''}" aria-label="Not interested">🚫 Not for me</button>
       </div>
     </div></article>`;
 }
@@ -255,8 +257,9 @@ function act(m, a) {
   const slim = {id: m.id, title: m.title, poster_path: m.poster_path, genre_ids: m.genre_ids || m.genres?.map(g => g.id) || [],
     original_language: m.original_language, vote_average: m.vote_average, release_date: m.release_date, overview: m.overview, t: Date.now()};
   if (a === 'w') S.watch[m.id] ? delete S.watch[m.id] : S.watch[m.id] = slim;
+  else if (a === 'x') { S.nope[m.id] ? delete S.nope[m.id] : (S.nope[m.id] = slim, delete S.ratings[m.id], delete S.watch[m.id]) }
   else if (S.ratings[m.id]?.r === +a) delete S.ratings[m.id];
-  else { S.ratings[m.id] = {...slim, r: +a}; delete S.watch[m.id] }
+  else { S.ratings[m.id] = {...slim, r: +a}; delete S.watch[m.id]; delete S.nope[m.id] }
   save();
 }
 
@@ -266,7 +269,7 @@ async function show() {
   try {
     if (tab === 'foryou') await forYou();
     else if (tab === 'watch') await listTab(S.watch, 'Nothing saved yet — hit “+ List” on anything.');
-    else if (tab === 'seen') await listTab(S.ratings, 'Nothing rated yet.');
+    else if (tab === 'seen') await listTab({...S.ratings, ...S.nope}, 'Nothing rated or hidden yet.');
   } catch (e) { status('Could not reach TMDB: ' + e.message) }
 }
 
@@ -287,9 +290,9 @@ function chrome() {
 // --- events ---
 $('#grid').addEventListener('click', e => {
   const b = e.target.closest('button[data-a]'); if (!b) return;
-  const el = b.closest('.card'), m = shown.get(+el.dataset.id) || S.ratings[el.dataset.id] || S.watch[el.dataset.id];
+  const el = b.closest('.card'), m = shown.get(+el.dataset.id) || S.ratings[el.dataset.id] || S.watch[el.dataset.id] || S.nope[el.dataset.id];
   act(m, b.dataset.a);
-  const gone = (tab === 'foryou' && S.ratings[m.id]) || (tab === 'watch' && !S.watch[m.id]) || (tab === 'seen' && !S.ratings[m.id]);
+  const gone = (tab === 'foryou' && (S.ratings[m.id] || S.nope[m.id])) || (tab === 'watch' && !S.watch[m.id]) || (tab === 'seen' && !S.ratings[m.id] && !S.nope[m.id]);
   if (gone) { el.style.opacity = 0; setTimeout(() => el.remove(), 300) }
   else el.outerHTML = card({...m, match: m.match});
 });
@@ -324,7 +327,7 @@ $('#gear').onclick = () => $('#settings').hidden = !$('#settings').hidden;
 $('#omdbform').onsubmit = e => { e.preventDefault(); S.omdb = $('#omdb').value.trim(); save(); chrome(); show() };
 $('#keyform').onsubmit = e => { e.preventDefault(); S.key = $('#key').value.trim(); save(); init() };
 $('#copy').onclick = () => {
-  $('#sync').value = JSON.stringify({ratings: S.ratings, watch: S.watch, off: S.off});
+  $('#sync').value = JSON.stringify({ratings: S.ratings, watch: S.watch, nope: S.nope, off: S.off});
   navigator.clipboard?.writeText($('#sync').value); status('Copied — paste it into Settings on your other device.');
 };
 $('#load').onclick = () => {
