@@ -189,9 +189,8 @@ function card(m) {
       <div class="prov">${logos}</div>
       <details><summary>About</summary>${esc(m.overview)} <a href="${yt}" target="_blank" rel="noopener">▶ Trailer</a></details>
       <div class="acts">
-        <button data-a="1" class="${r === 1 ? 'on' : ''}" aria-label="Liked it">👍</button>
-        <button data-a="-1" class="${r === -1 ? 'on' : ''}" aria-label="Not for me">👎</button>
-        <button data-a="0" class="${r === 0 ? 'on' : ''}">Seen</button>
+        <button data-a="1" class="${r === 1 ? 'on' : ''}" aria-label="Seen it, good">Seen 👍</button>
+        <button data-a="-1" class="${r === -1 ? 'on' : ''}" aria-label="Seen it, bad">Seen 👎</button>
         <button data-a="w" class="${S.watch[m.id] ? 'on' : ''}">${S.watch[m.id] ? '✓ List' : '+ List'}</button>
       </div>
     </div></article>`;
